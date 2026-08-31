@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.git/
+.gitignore
+.venv/
+venv/
+resultados_ibge/
