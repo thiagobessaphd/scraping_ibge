@@ -15,6 +15,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from dashboard_generator import gerar_conteudo_dashboard
+
 
 API_BASE = "https://servicodados.ibge.gov.br/api/v1/pesquisas/indicadores"
 TIMEOUT_API = (10, 60)
@@ -70,6 +72,7 @@ INDICADORES: dict[int, Indicador] = {
 
 SIMBOLOS_INDISPONIVEIS = frozenset({"", "-", "..", "...", "X"})
 PASTA_SAIDA = Path("resultados_ibge")
+CAMINHO_DASHBOARD = Path("dashboards/index.html")
 CAMPOS_SAIDA = [
     "municipio",
     "codigo_ibge",
@@ -298,8 +301,7 @@ def _escrever_atomico(caminho: Path, conteudo: str, encoding: str) -> None:
 
 
 def salvar_resultados(registros: list[Registro]) -> None:
-    """Publica as séries históricas nos formatos JSON e CSV."""
-    PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
+    """Publica as séries históricas e atualiza o dashboard autônomo."""
     caminho_json = PASTA_SAIDA / "municipios_ibge_historico.json"
     caminho_csv = PASTA_SAIDA / "municipios_ibge_historico.csv"
 
@@ -309,10 +311,21 @@ def salvar_resultados(registros: list[Registro]) -> None:
     escritor.writeheader()
     escritor.writerows(registros)
 
+    # O dashboard é validado antes da publicação dos dados. Assim, um template
+    # corrompido não substitui arquivos de resultados que ainda estejam válidos.
+    template_dashboard = CAMINHO_DASHBOARD.read_text(encoding="utf-8")
+    conteudo_dashboard = gerar_conteudo_dashboard(
+        registros, template_dashboard
+    )
+
+    PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
+    CAMINHO_DASHBOARD.parent.mkdir(parents=True, exist_ok=True)
     _escrever_atomico(caminho_json, conteudo_json, "utf-8")
     _escrever_atomico(caminho_csv, buffer_csv.getvalue(), "utf-8-sig")
+    _escrever_atomico(CAMINHO_DASHBOARD, conteudo_dashboard, "utf-8")
     print(f"JSON salvo em: {caminho_json.resolve()}")
     print(f"CSV salvo em:  {caminho_csv.resolve()}")
+    print(f"Dashboard salvo em: {CAMINHO_DASHBOARD.resolve()}")
 
 
 def main() -> None:

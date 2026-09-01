@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import requests
 
+import dashboard_generator
 import scraping_ibge_municipios as coletor
 
 
@@ -165,7 +166,17 @@ def test_consultar_api_converte_erro_http_em_erro_de_dominio() -> None:
 def test_salvar_resultados_gera_json_e_csv_equivalentes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(coletor, "PASTA_SAIDA", tmp_path)
+    pasta_resultados = tmp_path / "resultados"
+    caminho_dashboard = tmp_path / "dashboards" / "index.html"
+    caminho_dashboard.parent.mkdir()
+    caminho_dashboard.write_text(
+        "<main>layout preservado</main><script>"
+        f"{dashboard_generator.MARCADOR_INICIO}[]"
+        f"{dashboard_generator.MARCADOR_FIM}</script>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(coletor, "PASTA_SAIDA", pasta_resultados)
+    monkeypatch.setattr(coletor, "CAMINHO_DASHBOARD", caminho_dashboard)
     registros = coletor.normalizar_historico(
         _payload_completo(),
         "https://api.test",
@@ -175,14 +186,70 @@ def test_salvar_resultados_gera_json_e_csv_equivalentes(
 
     coletor.salvar_resultados(registros)
 
-    arquivo_json = tmp_path / "municipios_ibge_historico.json"
-    arquivo_csv = tmp_path / "municipios_ibge_historico.csv"
+    arquivo_json = pasta_resultados / "municipios_ibge_historico.json"
+    arquivo_csv = pasta_resultados / "municipios_ibge_historico.csv"
     assert json.loads(arquivo_json.read_text(encoding="utf-8")) == registros
     with arquivo_csv.open(encoding="utf-8-sig", newline="") as arquivo:
         linhas = list(csv.DictReader(arquivo))
     assert len(linhas) == len(registros)
     assert linhas[0]["municipio"] == "Cedro"
     assert linhas[0]["disponivel"] == "True"
+    dashboard = caminho_dashboard.read_text(encoding="utf-8")
+    assert "layout preservado" in dashboard
+    assert '"municipio":"Cedro"' in dashboard
+
+
+def test_dashboard_escapa_fechamento_de_script() -> None:
+    registro = {
+        "municipio": "Cidade </script><script>alert(1)</script>",
+        "codigo_ibge": "0000000",
+        "indicador_id": 1,
+        "indicador": "Teste",
+        "valor": "1",
+        "unidade": "%",
+        "periodo": "2025",
+        "disponivel": True,
+        "fonte": "Fonte",
+    }
+    template = (
+        f"<script>{dashboard_generator.MARCADOR_INICIO}[]"
+        f"{dashboard_generator.MARCADOR_FIM}</script>"
+    )
+
+    resultado = dashboard_generator.gerar_conteudo_dashboard(
+        [registro], template
+    )
+
+    assert resultado.count("</script>") == 1
+    assert "\\u003c/script>" in resultado
+
+
+def test_template_invalido_preserva_resultados_anteriores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pasta_resultados = tmp_path / "resultados"
+    pasta_resultados.mkdir()
+    caminho_json = pasta_resultados / "municipios_ibge_historico.json"
+    caminho_csv = pasta_resultados / "municipios_ibge_historico.csv"
+    caminho_json.write_text("dados anteriores", encoding="utf-8")
+    caminho_csv.write_text("csv anterior", encoding="utf-8")
+    caminho_dashboard = tmp_path / "index.html"
+    caminho_dashboard.write_text("sem marcadores", encoding="utf-8")
+    monkeypatch.setattr(coletor, "PASTA_SAIDA", pasta_resultados)
+    monkeypatch.setattr(coletor, "CAMINHO_DASHBOARD", caminho_dashboard)
+
+    with pytest.raises(ValueError, match="marcadores"):
+        coletor.salvar_resultados(
+            coletor.normalizar_historico(
+                _payload_completo(),
+                "https://api.test",
+                MUNICIPIOS_TESTE,
+                INDICADORES_TESTE,
+            )
+        )
+
+    assert caminho_json.read_text(encoding="utf-8") == "dados anteriores"
+    assert caminho_csv.read_text(encoding="utf-8") == "csv anterior"
 
 
 def test_main_nao_publica_quando_api_falha(

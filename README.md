@@ -12,7 +12,9 @@ Os mesmos municípios cearenses do projeto original são mantidos:
 - Aurora (`2301703`).
 
 Os resultados são exportados nos formatos CSV e JSON, com uma observação para
-cada combinação de município, indicador e período disponível.
+cada combinação de município, indicador e período disponível. A mesma execução
+também atualiza um dashboard HTML responsivo e autônomo em
+`dashboards/index.html`.
 
 ## Indicadores e cobertura histórica
 
@@ -36,6 +38,11 @@ todos os quatro municípios e todos os seis indicadores precisam estar
 presentes. Em caso de resposta parcial ou erro HTTP, os arquivos anteriores
 são preservados.
 
+Antes de publicar os resultados, o programa valida o template do dashboard e
+incorpora nele a base histórica. A página funciona offline, sem bibliotecas ou
+fontes externas, e oferece seleção de município e indicador, série temporal,
+comparação municipal, indicadores recentes, tabela filtrável e exportação CSV.
+
 As requisições possuem timeout e repetição automática para erros transitórios,
 como HTTP 429 e falhas 5xx. Os arquivos são gravados primeiro em caminhos
 temporários e publicados por substituição atômica.
@@ -53,6 +60,9 @@ temporários e publicados por substituição atômica.
 ```text
 .
 ├── scraping_ibge_municipios.py
+├── dashboard_generator.py
+├── dashboards/
+│   └── index.html
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── tests/
@@ -77,9 +87,12 @@ docker compose up --build
 Ao concluir, os arquivos estarão disponíveis em:
 
 ```text
-resultados_ibge/
-├── municipios_ibge_historico.csv
-└── municipios_ibge_historico.json
+.
+├── resultados_ibge/
+│   ├── municipios_ibge_historico.csv
+│   └── municipios_ibge_historico.json
+└── dashboards/
+    └── index.html
 ```
 
 Para executar novamente sem manter o contêiner:
@@ -99,6 +112,25 @@ pip install -r requirements.txt
 python scraping_ibge_municipios.py
 ```
 
+Ao final da coleta, o dashboard é regenerado automaticamente. Para atualizá-lo
+manualmente usando o JSON já existente, execute:
+
+```bash
+python dashboard_generator.py
+```
+
+## Visualizando o dashboard
+
+Abra `dashboards/index.html` diretamente no navegador. Como alternativa, sirva
+o projeto localmente e acesse `http://localhost:8000/dashboards/`:
+
+```bash
+python -m http.server 8000
+```
+
+O painel foi projetado para desktop e dispositivos móveis, possui tema claro e
+escuro, navegação acessível e não envia os dados coletados a serviços externos.
+
 No Windows PowerShell, a ativação do ambiente é feita com:
 
 ```powershell
@@ -113,8 +145,8 @@ pytest
 ```
 
 Os testes não acessam a internet: respostas da API são simuladas para validar
-URL, timeout, períodos, símbolos de indisponibilidade, falhas parciais e
-equivalência entre CSV e JSON.
+URL, timeout, períodos, símbolos de indisponibilidade, falhas parciais,
+equivalência entre CSV e JSON e geração segura do dashboard.
 
 ## Formato dos dados
 
