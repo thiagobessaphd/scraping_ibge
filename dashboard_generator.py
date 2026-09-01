@@ -10,7 +10,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 MARCADOR_INICIO = "/* DASHBOARD_DATA_START */"
 MARCADOR_FIM = "/* DASHBOARD_DATA_END */"
 ARQUIVO_DADOS = Path("resultados_ibge/municipios_ibge_historico.json")
@@ -62,13 +61,14 @@ def gerar_conteudo_dashboard(
     return padrao.sub(lambda _resultado: bloco, template, count=1)
 
 
-def escrever_atomico(caminho: Path, conteudo: str) -> None:
+def escrever_atomico(caminho: Path, conteudo: str, encoding: str = "utf-8") -> None:
+    """Grava conteúdo de forma atômica, em um arquivo temporário do mesmo diretório."""
     caminho.parent.mkdir(parents=True, exist_ok=True)
     temporario: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
-            encoding="utf-8",
+            encoding=encoding,
             newline="",
             dir=caminho.parent,
             prefix=f".{caminho.name}.",
@@ -92,7 +92,7 @@ def atualizar_dashboard(
     """Regenera o dashboard usando um JSON histórico já existente."""
     registros = json.loads(arquivo_dados.read_text(encoding="utf-8"))
     if not isinstance(registros, list):
-        raise ValueError("O arquivo de dados precisa conter uma lista JSON.")
+        raise TypeError("O arquivo de dados precisa conter uma lista JSON.")
     template = caminho_dashboard.read_text(encoding="utf-8")
     escrever_atomico(
         caminho_dashboard, gerar_conteudo_dashboard(registros, template)

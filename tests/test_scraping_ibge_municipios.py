@@ -10,7 +10,6 @@ import requests
 import dashboard_generator
 import scraping_ibge_municipios as coletor
 
-
 MUNICIPIOS_TESTE = {
     "Cedro": "2303808",
     "Aurora": "2301703",
@@ -255,7 +254,9 @@ def test_template_invalido_preserva_resultados_anteriores(
 def test_main_nao_publica_quando_api_falha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def falhar() -> list[coletor.Registro]:
+    def falhar(
+        municipios: object, indicadores: object
+    ) -> list[coletor.Registro]:
         raise RuntimeError("API indisponível")
 
     gravacoes: list[list[coletor.Registro]] = []
@@ -263,6 +264,145 @@ def test_main_nao_publica_quando_api_falha(
     monkeypatch.setattr(coletor, "salvar_resultados", gravacoes.append)
 
     with pytest.raises(RuntimeError, match="API indisponível"):
-        coletor.main()
+        coletor.main([])  # type: ignore[arg-type]
 
     assert gravacoes == []
+
+
+def test_carregar_config_parseia_municipios_e_indicadores(
+    tmp_path: Path,
+) -> None:
+    arquivo = tmp_path / "config.json"
+    arquivo.write_text(
+        json.dumps(
+            {
+                "municipios": {"Cedro": "2303808"},
+                "indicadores": [
+                    {
+                        "id": 60045,
+                        "nome": "Escolarização 6 a 14 anos",
+                        "unidade": "%",
+                        "fonte": "IBGE — Censos Demográficos",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    municipios, indicadores = coletor.carregar_config(str(arquivo))
+
+    assert municipios == {"Cedro": "2303808"}
+    assert set(indicadores) == {60045}
+    assert indicadores[60045].nome == "Escolarização 6 a 14 anos"
+    assert indicadores[60045].unidade == "%"
+
+
+def test_carregar_config_rejeita_municipios_com_tipo_invalido(
+    tmp_path: Path,
+) -> None:
+    arquivo = tmp_path / "config.json"
+    arquivo.write_text(
+        json.dumps(
+            {
+                "municipios": {"Cedro": 2303808},
+                "indicadores": [{"id": 1, "nome": "A", "unidade": "", "fonte": ""}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TypeError, match="municipios"):
+        coletor.carregar_config(str(arquivo))
+
+
+def test_carregar_config_rejeita_indicador_sem_id(tmp_path: Path) -> None:
+    arquivo = tmp_path / "config.json"
+    arquivo.write_text(
+        json.dumps({"municipios": {}, "indicadores": [{"nome": "A"}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="id"):
+        coletor.carregar_config(str(arquivo))
+
+
+def test_carregar_config_rejeita_ausencia_de_indicadores(
+    tmp_path: Path,
+) -> None:
+    arquivo = tmp_path / "config.json"
+    arquivo.write_text(json.dumps({"municipios": {}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Nenhum indicador"):
+        coletor.carregar_config(str(arquivo))
+
+
+def test_carregar_config_arquivo_ausente(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        coletor.carregar_config(str(tmp_path / "nao_existe.json"))
+
+
+def test_resolver_config_usando_arquivo(tmp_path: Path) -> None:
+    arquivo = tmp_path / "config.json"
+    arquivo.write_text(
+        json.dumps(
+            {"municipios": {"Aurora": "2301703"}, "indicadores": [{"id": 1}]}
+        ),
+        encoding="utf-8",
+    )
+
+    municipios, indicadores = coletor._resolver_config(str(arquivo))
+    assert municipios == {"Aurora": "2301703"}
+    assert set(indicadores) == {1}
+
+
+def test_resolver_config_usando_padroes() -> None:
+    municipios, indicadores = coletor._resolver_config(None)
+    assert municipios == coletor.MUNICIPIOS
+    assert set(indicadores) == set(coletor.INDICADORES)
+
+
+def test_main_com_versao_exibe_e_sai(capsys: pytest.CaptureFixture[str]) -> None:
+    coletor.main(["--versao"])
+    saida = capsys.readouterr().out
+    assert f"scraping-ibge v{coletor.VERSION}" in saida
+
+
+def test_parser_expoe_opcoes_cli() -> None:
+    parser = coletor._criar_parser()
+    acoes = {acao.dest for acao in parser._actions}
+    assert {"config", "saida", "dashboard", "versao"} <= acoes
+
+
+def test_salvar_resultados_dashboard_novo_usa_template_do_repositorio(
+    tmp_path: Path,
+) -> None:
+    pasta_resultados = tmp_path / "resultados"
+    template_dir = tmp_path / "template_dash"
+    template_dir.mkdir()
+    template = template_dir / "index.html"
+    template.write_text(
+        "<main>template</main><script>"
+        f"{dashboard_generator.MARCADOR_INICIO}[]"
+        f"{dashboard_generator.MARCADOR_FIM}</script>",
+        encoding="utf-8",
+    )
+    destino = tmp_path / "dash_app" / "novo.html"
+    registros = coletor.normalizar_historico(
+        _payload_completo(),
+        "https://api.test",
+        MUNICIPIOS_TESTE,
+        INDICADORES_TESTE,
+    )
+
+    coletor.salvar_resultados(
+        registros,
+        pasta_saida=pasta_resultados,
+        caminho_dashboard=destino,
+        template_dashboard=template,
+    )
+
+    assert destino.exists()
+    conteudo = destino.read_text(encoding="utf-8")
+    assert "template" in conteudo
+    assert '"municipio":"Cedro"' in conteudo
