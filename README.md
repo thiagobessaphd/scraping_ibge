@@ -49,11 +49,12 @@ temporários e publicados por substituição atômica.
 
 ## Tecnologias
 
-- Python 3.12;
+- Python 3.10+;
 - Requests;
 - API de Pesquisas do IBGE;
 - Docker e Docker Compose;
-- Pytest.
+- Pytest;
+- Ruff (lint).
 
 ## Estrutura do projeto
 
@@ -65,6 +66,7 @@ temporários e publicados por substituição atômica.
 │   └── index.html
 ├── requirements.txt
 ├── requirements-dev.txt
+├── pyproject.toml
 ├── tests/
 │   └── test_scraping_ibge_municipios.py
 ├── Dockerfile
@@ -103,7 +105,7 @@ docker compose run --rm scraper-ibge
 
 ## Executando sem Docker
 
-Crie e ative um ambiente virtual com Python 3.12 ou superior:
+Crie e ative um ambiente virtual com Python 3.10 ou superior:
 
 ```bash
 python -m venv .venv
@@ -118,6 +120,56 @@ manualmente usando o JSON já existente, execute:
 ```bash
 python dashboard_generator.py
 ```
+
+### Linha de comando
+
+O script aceita argumentos para personalizar a coleta sem editar o código:
+
+```bash
+python scraping_ibge_municipios.py \
+  --config config.json \
+  --saida resultados_custom \
+  --dashboard dashboards/index.html
+```
+
+- `--config ARQUIVO` — arquivo JSON opcional com municípios e indicadores
+  personalizados (veja a seção a seguir). Quando ausente, usa os padrões
+  embutidos no módulo.
+- `--saida DIR` — diretório de saída dos resultados (padrão:
+  `resultados_ibge`).
+- `--dashboard CAMINHO` — caminho do arquivo do dashboard (padrão:
+  `dashboards/index.html`). Quando apontado para um caminho novo, o template é
+  tomado do dashboard embutido no repositório.
+- `--versao` — exibe a versão e encerra a execução.
+
+A mesma interface está disponível como o console script `scraping-ibge` após
+instalar o pacote (`pip install -e .`).
+
+## Formato do arquivo de configuração
+
+Para coletar municípios ou indicadores diferentes dos padrões, crie um JSON e
+informe-o com `--config`:
+
+```json
+{
+  "municipios": {
+    "Cedro": "2303808",
+    "Fortaleza": "2304400"
+  },
+  "indicadores": [
+    {
+      "id": 60045,
+      "nome": "Escolarização 6 a 14 anos",
+      "unidade": "%",
+      "fonte": "IBGE — Censos Demográficos"
+    }
+  ]
+}
+```
+
+Um arquivo ausente levanta `FileNotFoundError`; conteúdo com tipo inesperado
+levanta `TypeError`; e campos ausentes ou inválidos levantam `ValueError`, sem
+publicar resultados parciais.
 
 ## Visualizando o dashboard
 
@@ -170,9 +222,17 @@ dado de valores numéricos iguais a zero.
 
 ## Adicionando municípios
 
-Edite o dicionário `MUNICIPIOS` no início de
-`scraping_ibge_municipios.py`, informando o nome e o código IBGE de sete
-dígitos:
+Há duas formas igualmente válidas:
+
+1. **Sem tocar no código** — crie um arquivo JSON com os municípios desejados e
+   informe-o com `--config` (veja a seção
+   [Formato do arquivo de configuração](#formato-do-arquivo-de-configuração)).
+   Essa opção é recomendada para customizações pontuais de municípios ou
+   indicadores.
+
+2. **Padrões embutidos** — edite o dicionário `MUNICIPIOS` no início de
+   `scraping_ibge_municipios.py`, informando o nome e o código IBGE de sete
+   dígitos:
 
 ```python
 MUNICIPIOS = {

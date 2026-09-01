@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import io
 import json
-import os
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,9 +14,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from dashboard_generator import gerar_conteudo_dashboard
+from dashboard_generator import escrever_atomico, gerar_conteudo_dashboard
 
-
+VERSION = "1.1.0"
 API_BASE = "https://servicodados.ibge.gov.br/api/v1/pesquisas/indicadores"
 TIMEOUT_API = (10, 60)
 
@@ -278,32 +277,17 @@ def coletar_historico(
     return normalizar_historico(conteudo, url, municipios, indicadores)
 
 
-def _escrever_atomico(caminho: Path, conteudo: str, encoding: str) -> None:
-    temporario: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding=encoding,
-            newline="",
-            dir=caminho.parent,
-            prefix=f".{caminho.name}.",
-            delete=False,
-        ) as arquivo:
-            temporario = Path(arquivo.name)
-            arquivo.write(conteudo)
-            arquivo.flush()
-            os.fsync(arquivo.fileno())
-        temporario.replace(caminho)
-    except Exception:
-        if temporario is not None:
-            temporario.unlink(missing_ok=True)
-        raise
-
-
-def salvar_resultados(registros: list[Registro]) -> None:
+def salvar_resultados(
+    registros: list[Registro],
+    pasta_saida: Path | None = None,
+    caminho_dashboard: Path | None = None,
+    template_dashboard: Path | None = None,
+) -> None:
     """Publica as séries históricas e atualiza o dashboard autônomo."""
-    caminho_json = PASTA_SAIDA / "municipios_ibge_historico.json"
-    caminho_csv = PASTA_SAIDA / "municipios_ibge_historico.csv"
+    pasta_saida = pasta_saida or PASTA_SAIDA
+    caminho_dashboard = caminho_dashboard or CAMINHO_DASHBOARD
+    caminho_json = pasta_saida / "municipios_ibge_historico.json"
+    caminho_csv = pasta_saida / "municipios_ibge_historico.csv"
 
     conteudo_json = json.dumps(registros, ensure_ascii=False, indent=2)
     buffer_csv = io.StringIO(newline="")
@@ -311,35 +295,155 @@ def salvar_resultados(registros: list[Registro]) -> None:
     escritor.writeheader()
     escritor.writerows(registros)
 
-    # O dashboard é validado antes da publicação dos dados. Assim, um template
-    # corrompido não substitui arquivos de resultados que ainda estejam válidos.
-    template_dashboard = CAMINHO_DASHBOARD.read_text(encoding="utf-8")
+    # O template que contém os marcadores é sempre o dashboard embutido no
+    # repositório. O parâmetro ``template_dashboard`` permite apontar para um
+    # arquivo alternativo; quando ausente, usa-se o próprio ``caminho_dashboard``
+    # (que, na execução padrão, é o mesmo arquivo). Assim, um ``--dashboard``
+    # apontando para um caminho ainda inexistente não impede a geração.
+    origem_template = template_dashboard or caminho_dashboard
+    conteudo_template = origem_template.read_text(encoding="utf-8")
     conteudo_dashboard = gerar_conteudo_dashboard(
-        registros, template_dashboard
+        registros, conteudo_template
     )
 
-    PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
-    CAMINHO_DASHBOARD.parent.mkdir(parents=True, exist_ok=True)
-    _escrever_atomico(caminho_json, conteudo_json, "utf-8")
-    _escrever_atomico(caminho_csv, buffer_csv.getvalue(), "utf-8-sig")
-    _escrever_atomico(CAMINHO_DASHBOARD, conteudo_dashboard, "utf-8")
+    pasta_saida.mkdir(parents=True, exist_ok=True)
+    caminho_dashboard.parent.mkdir(parents=True, exist_ok=True)
+    escrever_atomico(caminho_json, conteudo_json, "utf-8")
+    escrever_atomico(caminho_csv, buffer_csv.getvalue(), "utf-8-sig")
+    escrever_atomico(caminho_dashboard, conteudo_dashboard, "utf-8")
     print(f"JSON salvo em: {caminho_json.resolve()}")
     print(f"CSV salvo em:  {caminho_csv.resolve()}")
-    print(f"Dashboard salvo em: {CAMINHO_DASHBOARD.resolve()}")
+    print(f"Dashboard salvo em: {caminho_dashboard.resolve()}")
 
 
-def main() -> None:
+def carregar_config(caminho: str) -> tuple[dict[str, str], dict[int, Indicador]]:
+    """Carrega municípios e indicadores a partir de um arquivo JSON.
+
+    Formato esperado:
+
+    .. code-block:: json
+
+        {
+          "municipios": {"Cedro": "2303808"},
+          "indicadores": [
+            {"id": 60045, "nome": "Escolarização 6 a 14 anos",
+             "unidade": "%", "fonte": "IBGE — Censos Demográficos"}
+          ]
+        }
+
+    Retorna uma tupla ``(municipios, indicadores)`` pronta para as funções
+    de consulta. Um arquivo ausente levanta ``FileNotFoundError``; conteúdo de
+    tipo inesperado levanta ``TypeError``; e campos ausentes ou inválidos
+    levantam ``ValueError``.
+    """
+    dados = json.loads(Path(caminho).read_text(encoding="utf-8"))
+    if not isinstance(dados, dict):
+        raise TypeError("O arquivo de configuração precisa ser um objeto JSON.")
+
+    municipios = dados.get("municipios", {})
+    if not isinstance(municipios, dict) or not all(
+        isinstance(v, str) for v in municipios.values()
+    ):
+        raise TypeError(
+            "'municipios' deve ser um objeto com códigos IBGE como strings."
+        )
+
+    indicadores: dict[int, Indicador] = {}
+    for item in dados.get("indicadores", []):
+        if not isinstance(item, dict):
+            raise TypeError("Cada indicador deve ser um objeto.")
+        try:
+            identificador = int(item["id"])
+        except KeyError as erro:
+            raise ValueError("Cada indicador precisa de um 'id' inteiro.") from erro
+        except (TypeError, ValueError) as erro:
+            raise TypeError(
+                "O 'id' de cada indicador precisa ser um inteiro."
+            ) from erro
+        indicadores[identificador] = Indicador(
+            nome=str(item.get("nome", "Indicador")),
+            unidade=str(item.get("unidade", "")),
+            fonte=str(item.get("fonte", "")),
+        )
+    if not indicadores:
+        raise ValueError("Nenhum indicador foi informado no arquivo.")
+
+    return dict(municipios), indicadores
+
+
+def _resolver_config(
+    caminho: str | None,
+) -> tuple[dict[str, str], dict[int, Indicador]]:
+    """Devolve a configuração efetiva, seja do arquivo ou dos padrões embutidos."""
+    if caminho:
+        return carregar_config(caminho)
+    return dict(MUNICIPIOS), dict(INDICADORES)
+
+
+def _criar_parser() -> argparse.ArgumentParser:
+    """Cria o analisador de argumentos da linha de comando."""
+    parser = argparse.ArgumentParser(
+        prog="scraping_ibge_municipios",
+        description=(
+            "Coleta séries históricas municipais na API oficial do IBGE "
+            "e publica os resultados em CSV, JSON e um dashboard HTML."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="ARQUIVO",
+        help=(
+            "Arquivo JSON opcional com municípios e indicadores personalizados. "
+            "Quando ausente, usa os padrões embutidos no módulo."
+        ),
+    )
+    parser.add_argument(
+        "--saida",
+        metavar="DIR",
+        help="Diretório de saída dos resultados (padrão: resultados_ibge).",
+    )
+    parser.add_argument(
+        "--dashboard",
+        metavar="CAMINHO",
+        help="Caminho do arquivo do dashboard (padrão: dashboards/index.html).",
+    )
+    parser.add_argument(
+        "--versao",
+        action="store_true",
+        help="Exibe a versão e encerra a execução.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    argumentos = _criar_parser().parse_args(argv)
+
+    if argumentos.versao:
+        print(f"scraping-ibge v{VERSION}")
+        return
+
+    municipios, indicadores = _resolver_config(argumentos.config)
+    pasta_saida = Path(argumentos.saida or PASTA_SAIDA)
+    caminho_dashboard = Path(argumentos.dashboard or CAMINHO_DASHBOARD)
+    # Um dashboard próprio recebe o template do arquivo embutido no repositório,
+    # para que a geração funcione mesmo quando o caminho de destino é novo.
+    template = (
+        CAMINHO_DASHBOARD if argumentos.dashboard else None
+    )
+
     print("Consultando séries históricas na API do IBGE...")
-    registros = coletar_historico()
+    registros = coletar_historico(
+        municipios=municipios, indicadores=indicadores
+    )
     if not registros:
         raise RuntimeError(
             "Nenhuma série histórica foi retornada; nada foi publicado."
         )
 
-    for municipio in MUNICIPIOS:
+    for municipio in municipios:
         quantidade = sum(item["municipio"] == municipio for item in registros)
         print(f"  {municipio}: {quantidade} observações históricas.")
-    salvar_resultados(registros)
+    salvar_resultados(registros, pasta_saida, caminho_dashboard, template)
 
 
 if __name__ == "__main__":
