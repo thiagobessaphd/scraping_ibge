@@ -5,9 +5,9 @@ services:
       dockerfile: Dockerfile
     container_name: scraper-ibge-municipios
     init: true
-    shm_size: "1gb"
     security_opt:
       - no-new-privileges:true
     volumes:
       - ./resultados_ibge:/app/resultados_ibge
+      - ./dashboards:/app/dashboards
     restart: "no"

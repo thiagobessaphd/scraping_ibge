@@ -3,227 +3,266 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from bs4 import BeautifulSoup
+import requests
 
-import scraping_ibge_municipios as scraper
-
-
-def _tag(html: str):
-    return BeautifulSoup(html, "html.parser").find()
+import dashboard_generator
+import scraping_ibge_municipios as coletor
 
 
-def _card(
-    titulo: str,
-    valor: str,
-    *,
-    unidade: str = "",
-    periodo: str = "",
-    fonte: str = "",
-) -> str:
-    return f"""
-    <article class="indicador">
-      <div class="indicador__titulo">{titulo}</div>
-      <div class="indicador__valor">{valor}</div>
-      <div class="indicador__unidade">{unidade}</div>
-      <div class="indicador__periodo">{periodo}</div>
-      <div class="indicador__fonte">{fonte}</div>
-    </article>
-    """
+MUNICIPIOS_TESTE = {
+    "Cedro": "2303808",
+    "Aurora": "2301703",
+}
+INDICADORES_TESTE = {
+    1: coletor.Indicador("Indicador A", "%", "Fonte A"),
+    2: coletor.Indicador("Indicador B", "R$", "Fonte B"),
+}
 
 
-def test_texto_normaliza_espacos_inclusive_nbsp() -> None:
-    elemento = _tag("<span>  Índice\n de\t desenvolvimento\xa0 humano  </span>")
-
-    assert scraper.texto(elemento) == "Índice de desenvolvimento humano"
-    assert scraper.texto(None) == ""
-
-
-def test_extrair_indicadores_ignora_cards_incompletos() -> None:
-    html = (
-        _card("PIB per capita", "R$ 27.500,10 [2023]")
-        + _card("", "123")
-        + _card("Escolarização", "")
-        + _card("Mesmo conteúdo", "Mesmo conteúdo")
-    )
-
-    indicadores = scraper.extrair_indicadores(html)
-
-    assert len(indicadores) == 1
-    assert indicadores[0]["indicador"] == "PIB per capita"
-
-
-def test_extrair_indicadores_separa_valor_unidade_e_periodo_embutidos() -> None:
-    indicadores = scraper.extrair_indicadores(
-        _card("População no último censo", "22.344 pessoas [2022]")
-    )
-
-    assert indicadores == [
+def _payload_completo() -> list[dict[str, object]]:
+    return [
         {
-            "indicador": "População no último censo",
-            "valor": "22.344",
-            "unidade": "pessoas",
-            "periodo": "2022",
-            "fonte": "",
-        }
+            "localidade": "230380",
+            "res": [
+                {
+                    "indicador": 1,
+                    "res": {"2010": "10.5", "2022": "-"},
+                    "notas": {"2010": None, "2022": "Não disponível"},
+                },
+                {
+                    "indicador": 2,
+                    "res": {"2021": "1000.00"},
+                    "notas": {"2021": None},
+                },
+            ],
+        },
+        {
+            "localidade": "230170",
+            "res": [
+                {
+                    "indicador": 1,
+                    "res": {"2010": "20.0"},
+                    "notas": {"2010": None},
+                },
+                {
+                    "indicador": 2,
+                    "res": {"2021": "2000.00"},
+                    "notas": {"2021": None},
+                },
+            ],
+        },
     ]
 
 
-def test_campos_explicitos_prevalecem_sobre_metadados_embutidos() -> None:
-    indicadores = scraper.extrair_indicadores(
-        _card(
-            "Escolarização 6 a 14 anos",
-            "97,5 % [2010]",
-            unidade="percentual",
-            periodo="Censo 2022",
-            fonte="IBGE",
-        )
+class RespostaFalsa:
+    def __init__(self, payload: object, url: str = "https://api.test/consulta"):
+        self._payload = payload
+        self.url = url
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> object:
+        return self._payload
+
+
+class SessaoFalsa:
+    def __init__(self, resposta: RespostaFalsa):
+        self.resposta = resposta
+        self.chamadas: list[tuple[str, object]] = []
+
+    def get(self, url: str, timeout: object) -> RespostaFalsa:
+        self.chamadas.append((url, timeout))
+        return self.resposta
+
+
+def test_montar_url_agrupa_municipios_e_indicadores() -> None:
+    url = coletor.montar_url(MUNICIPIOS_TESTE, INDICADORES_TESTE)
+
+    assert "/1|2/resultados/2303808|2301703" in url
+    assert url.endswith("?groupBy=localidade")
+
+
+def test_normalizar_historico_preserva_periodos_notas_e_indisponibilidade() -> None:
+    registros = coletor.normalizar_historico(
+        _payload_completo(),
+        "https://api.test/consulta",
+        MUNICIPIOS_TESTE,
+        INDICADORES_TESTE,
     )
 
-    assert indicadores[0] == {
-        "indicador": "Escolarização 6 a 14 anos",
-        "valor": "97,5",
-        "unidade": "percentual",
-        "periodo": "Censo 2022",
-        "fonte": "IBGE",
+    assert len(registros) == 5
+    assert registros[0] == {
+        "municipio": "Cedro",
+        "codigo_ibge": "2303808",
+        "indicador_id": 1,
+        "indicador": "Indicador A",
+        "valor": "10.5",
+        "unidade": "%",
+        "periodo": "2010",
+        "disponivel": True,
+        "nota": "",
+        "fonte": "Fonte A",
+        "url": "https://api.test/consulta",
     }
+    indisponivel = registros[1]
+    assert indisponivel["valor"] == "-"
+    assert indisponivel["disponivel"] is False
+    assert indisponivel["nota"] == "Não disponível"
 
 
-def test_deduplicacao_considera_periodo() -> None:
-    html = (
-        _card("PIB per capita", "20.000 reais", periodo="2022")
-        + _card("PIB per capita", "20.000 reais", periodo="2023")
-        + _card("PIB per capita", "20.000 reais", periodo="2023")
+def test_normalizar_historico_rejeita_municipio_ausente() -> None:
+    with pytest.raises(coletor.RespostaAPIInvalida, match="Municípios ausentes"):
+        coletor.normalizar_historico(
+            _payload_completo()[:1],
+            "https://api.test",
+            MUNICIPIOS_TESTE,
+            INDICADORES_TESTE,
+        )
+
+
+def test_normalizar_historico_rejeita_indicador_ausente() -> None:
+    payload = _payload_completo()
+    payload[1]["res"] = payload[1]["res"][:1]  # type: ignore[index]
+
+    with pytest.raises(coletor.RespostaAPIInvalida, match="Indicadores ausentes"):
+        coletor.normalizar_historico(
+            payload,
+            "https://api.test",
+            MUNICIPIOS_TESTE,
+            INDICADORES_TESTE,
+        )
+
+
+def test_consultar_api_usa_timeout_e_url_final() -> None:
+    sessao = SessaoFalsa(RespostaFalsa(_payload_completo()))
+
+    conteudo, url = coletor.consultar_api(
+        sessao,  # type: ignore[arg-type]
+        MUNICIPIOS_TESTE,
+        INDICADORES_TESTE,
     )
 
-    indicadores = scraper.extrair_indicadores(html)
-
-    assert [(item["valor"], item["periodo"]) for item in indicadores] == [
-        ("20.000", "2022"),
-        ("20.000", "2023"),
-    ]
+    assert conteudo == _payload_completo()
+    assert url == "https://api.test/consulta"
+    assert sessao.chamadas[0][1] == coletor.TIMEOUT_API
 
 
-@pytest.mark.parametrize(
-    "titulo",
-    [
-        "Escolarização",
-        "IDHM Índice de desenvolvimento humano municipal",
-        "Mortalidade infantil",
-        "Total de receitas brutas realizadas",
-        "Total de despesas brutas empenhadas",
-        "PIB per capita",
-    ],
-)
-def test_extrai_indicadores_adicionais(titulo: str) -> None:
-    indicadores = scraper.extrair_indicadores(
-        _card(titulo, "123,45", unidade="unidade", periodo="2023")
-    )
+def test_consultar_api_converte_erro_http_em_erro_de_dominio() -> None:
+    class SessaoComFalha:
+        def get(self, _url: str, timeout: object) -> object:
+            raise requests.Timeout(f"timeout {timeout}")
 
-    assert indicadores[0]["indicador"] == titulo
+    with pytest.raises(RuntimeError, match="Falha ao consultar"):
+        coletor.consultar_api(
+            SessaoComFalha(),  # type: ignore[arg-type]
+            MUNICIPIOS_TESTE,
+            INDICADORES_TESTE,
+        )
 
 
 def test_salvar_resultados_gera_json_e_csv_equivalentes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pasta_saida = tmp_path / "resultados"
-    monkeypatch.setattr(scraper, "PASTA_SAIDA", pasta_saida)
-    registros = [
-        {
-            "municipio": "Várzea Alegre",
-            "indicador": "PIB per capita",
-            "valor": "27.500,10",
-            "unidade": "R$",
-            "periodo": "2023",
-            "fonte": "IBGE",
-            "url": "https://example.test/varzea-alegre",
-        }
-    ]
-
-    scraper.salvar_resultados(registros)
-
-    arquivo_json = pasta_saida / "municipios_ibge.json"
-    arquivo_csv = pasta_saida / "municipios_ibge.csv"
-    assert json.loads(arquivo_json.read_text(encoding="utf-8")) == registros
-    with arquivo_csv.open(encoding="utf-8-sig", newline="") as arquivo:
-        assert list(csv.DictReader(arquivo)) == registros
-
-
-def test_coletar_municipios_reporta_falhas_sem_descartar_sucessos(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    municipios = {
-        "Município OK": "https://example.test/ok",
-        "Município com falha": "https://example.test/falha",
-    }
-
-    def carregar(_page, url: str) -> str:
-        if url.endswith("/falha"):
-            raise RuntimeError("serviço indisponível")
-        return _card("PIB per capita", "123 reais [2023]")
-
-    monkeypatch.setattr(scraper, "carregar_pagina", carregar)
-
-    registros, falhas = scraper.coletar_municipios(object(), municipios)
-
-    assert len(registros) == 1
-    assert registros[0]["municipio"] == "Município OK"
-    assert registros[0]["url"] == "https://example.test/ok"
-    assert falhas.keys() == {"Município com falha"}
-    assert "indisponível" in falhas["Município com falha"]
-
-
-class _FakeBrowser:
-    def new_context(self, **_kwargs):
-        return self
-
-    def new_page(self):
-        return SimpleNamespace()
-
-    def close(self) -> None:
-        pass
-
-
-class _FakePlaywright:
-    def __init__(self) -> None:
-        self.chromium = self
-
-    def launch(self, **_kwargs):
-        return _FakeBrowser()
-
-
-class _FakePlaywrightContext:
-    def __enter__(self):
-        return _FakePlaywright()
-
-    def __exit__(self, *_args) -> None:
-        pass
-
-
-def test_falha_parcial_nao_publica_resultados(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    municipios = {
-        "Município OK": "https://example.test/ok",
-        "Município com falha": "https://example.test/falha",
-    }
-    monkeypatch.setattr(scraper, "MUNICIPIOS", municipios)
-    monkeypatch.setattr(
-        scraper, "sync_playwright", lambda: _FakePlaywrightContext()
+    pasta_resultados = tmp_path / "resultados"
+    caminho_dashboard = tmp_path / "dashboards" / "index.html"
+    caminho_dashboard.parent.mkdir()
+    caminho_dashboard.write_text(
+        "<main>layout preservado</main><script>"
+        f"{dashboard_generator.MARCADOR_INICIO}[]"
+        f"{dashboard_generator.MARCADOR_FIM}</script>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(coletor, "PASTA_SAIDA", pasta_resultados)
+    monkeypatch.setattr(coletor, "CAMINHO_DASHBOARD", caminho_dashboard)
+    registros = coletor.normalizar_historico(
+        _payload_completo(),
+        "https://api.test",
+        MUNICIPIOS_TESTE,
+        INDICADORES_TESTE,
     )
 
-    def carregar(_page, url: str) -> str:
-        if url.endswith("/falha"):
-            raise RuntimeError("indisponível")
-        return _card("PIB per capita", "123 reais [2023]")
+    coletor.salvar_resultados(registros)
 
-    monkeypatch.setattr(scraper, "carregar_pagina", carregar)
-    gravacoes: list[list[dict[str, str]]] = []
-    monkeypatch.setattr(scraper, "salvar_resultados", gravacoes.append)
+    arquivo_json = pasta_resultados / "municipios_ibge_historico.json"
+    arquivo_csv = pasta_resultados / "municipios_ibge_historico.csv"
+    assert json.loads(arquivo_json.read_text(encoding="utf-8")) == registros
+    with arquivo_csv.open(encoding="utf-8-sig", newline="") as arquivo:
+        linhas = list(csv.DictReader(arquivo))
+    assert len(linhas) == len(registros)
+    assert linhas[0]["municipio"] == "Cedro"
+    assert linhas[0]["disponivel"] == "True"
+    dashboard = caminho_dashboard.read_text(encoding="utf-8")
+    assert "layout preservado" in dashboard
+    assert '"municipio":"Cedro"' in dashboard
 
-    with pytest.raises(RuntimeError, match="falha|incompleta|parcial"):
-        scraper.main()
+
+def test_dashboard_escapa_fechamento_de_script() -> None:
+    registro = {
+        "municipio": "Cidade </script><script>alert(1)</script>",
+        "codigo_ibge": "0000000",
+        "indicador_id": 1,
+        "indicador": "Teste",
+        "valor": "1",
+        "unidade": "%",
+        "periodo": "2025",
+        "disponivel": True,
+        "fonte": "Fonte",
+    }
+    template = (
+        f"<script>{dashboard_generator.MARCADOR_INICIO}[]"
+        f"{dashboard_generator.MARCADOR_FIM}</script>"
+    )
+
+    resultado = dashboard_generator.gerar_conteudo_dashboard(
+        [registro], template
+    )
+
+    assert resultado.count("</script>") == 1
+    assert "\\u003c/script>" in resultado
+
+
+def test_template_invalido_preserva_resultados_anteriores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pasta_resultados = tmp_path / "resultados"
+    pasta_resultados.mkdir()
+    caminho_json = pasta_resultados / "municipios_ibge_historico.json"
+    caminho_csv = pasta_resultados / "municipios_ibge_historico.csv"
+    caminho_json.write_text("dados anteriores", encoding="utf-8")
+    caminho_csv.write_text("csv anterior", encoding="utf-8")
+    caminho_dashboard = tmp_path / "index.html"
+    caminho_dashboard.write_text("sem marcadores", encoding="utf-8")
+    monkeypatch.setattr(coletor, "PASTA_SAIDA", pasta_resultados)
+    monkeypatch.setattr(coletor, "CAMINHO_DASHBOARD", caminho_dashboard)
+
+    with pytest.raises(ValueError, match="marcadores"):
+        coletor.salvar_resultados(
+            coletor.normalizar_historico(
+                _payload_completo(),
+                "https://api.test",
+                MUNICIPIOS_TESTE,
+                INDICADORES_TESTE,
+            )
+        )
+
+    assert caminho_json.read_text(encoding="utf-8") == "dados anteriores"
+    assert caminho_csv.read_text(encoding="utf-8") == "csv anterior"
+
+
+def test_main_nao_publica_quando_api_falha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def falhar() -> list[coletor.Registro]:
+        raise RuntimeError("API indisponível")
+
+    gravacoes: list[list[coletor.Registro]] = []
+    monkeypatch.setattr(coletor, "coletar_historico", falhar)
+    monkeypatch.setattr(coletor, "salvar_resultados", gravacoes.append)
+
+    with pytest.raises(RuntimeError, match="API indisponível"):
+        coletor.main()
 
     assert gravacoes == []

@@ -1,22 +1,22 @@
-FROM mcr.microsoft.com/playwright/python:v1.55.0-noble
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOME=/home/pwuser
+    HOME=/home/appuser
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=pwuser:pwuser scraping_ibge_municipios.py .
+RUN useradd --create-home --uid 1001 appuser
 
-# A imagem oficial fornece o usuário sem privilégios "pwuser" e os
-# navegadores instalados em /ms-playwright. O diretório é criado aqui para
-# também funcionar quando não houver um volume montado pelo Compose.
-RUN mkdir -p /app/resultados_ibge \
-    && chown -R pwuser:pwuser /app
+COPY --chown=appuser:appuser scraping_ibge_municipios.py dashboard_generator.py ./
+COPY --chown=appuser:appuser dashboards/index.html ./dashboards/index.html
 
-USER pwuser
+RUN mkdir -p /app/resultados_ibge /app/dashboards \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 CMD ["python", "scraping_ibge_municipios.py"]
