@@ -1,4 +1,4 @@
-"""Coleta e exporta indicadores municipais exibidos pelo IBGE."""
+"""Coleta séries históricas municipais na API oficial do IBGE."""
 
 from __future__ import annotations
 
@@ -6,258 +6,276 @@ import csv
 import io
 import json
 import os
-import re
 import tempfile
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
-from bs4 import BeautifulSoup, Tag
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-MUNICIPIOS = {
-    "Cedro": "https://www.ibge.gov.br/cidades-e-estados/ce/cedro.html",
-    "Várzea Alegre": "https://www.ibge.gov.br/cidades-e-estados/ce/varzea-alegre.html",
-    "Lavras da Mangabeira": (
-        "https://www.ibge.gov.br/cidades-e-estados/ce/"
-        "lavras-da-mangabeira.html"
-    ),
-    "Aurora": "https://www.ibge.gov.br/cidades-e-estados/ce/aurora.html",
+API_BASE = "https://servicodados.ibge.gov.br/api/v1/pesquisas/indicadores"
+TIMEOUT_API = (10, 60)
+
+# Os códigos são os identificadores oficiais de sete dígitos dos municípios.
+MUNICIPIOS: dict[str, str] = {
+    "Cedro": "2303808",
+    "Várzea Alegre": "2314003",
+    "Lavras da Mangabeira": "2307502",
+    "Aurora": "2301703",
 }
 
-INDICADORES_OBRIGATORIOS = frozenset(
-    {
-        "Prefeito",
-        "Gentílico",
-        "Área Territorial",
-        "População no último censo",
-        "Densidade demográfica",
-        "População estimada",
-        "Escolarização 6 a 14 anos",
-        "IDHM Índice de desenvolvimento humano municipal",
-        "Mortalidade infantil",
-        "Total de receitas brutas realizadas",
-        "Total de despesas brutas empenhadas",
-        "PIB per capita",
-    }
-)
 
+@dataclass(frozen=True)
+class Indicador:
+    nome: str
+    unidade: str
+    fonte: str
+
+
+INDICADORES: dict[int, Indicador] = {
+    60045: Indicador(
+        "Escolarização 6 a 14 anos",
+        "%",
+        "IBGE — Censos Demográficos",
+    ),
+    329756: Indicador(
+        "IDHM Índice de desenvolvimento humano municipal",
+        "índice",
+        "Programa das Nações Unidas para o Desenvolvimento — PNUD",
+    ),
+    30279: Indicador(
+        "Mortalidade infantil",
+        "óbitos por mil nascidos vivos",
+        "Ministério da Saúde — DATASUS",
+    ),
+    28141: Indicador(
+        "Total de receitas brutas realizadas",
+        "R$",
+        "Siconfi — Secretaria do Tesouro Nacional",
+    ),
+    29749: Indicador(
+        "Total de despesas brutas empenhadas",
+        "R$",
+        "Siconfi — Secretaria do Tesouro Nacional",
+    ),
+    47001: Indicador(
+        "PIB per capita",
+        "R$",
+        "IBGE — Produto Interno Bruto dos Municípios",
+    ),
+}
+
+SIMBOLOS_INDISPONIVEIS = frozenset({"", "-", "..", "...", "X"})
 PASTA_SAIDA = Path("resultados_ibge")
 CAMPOS_SAIDA = [
     "municipio",
+    "codigo_ibge",
+    "indicador_id",
     "indicador",
     "valor",
     "unidade",
     "periodo",
+    "disponivel",
+    "nota",
     "fonte",
     "url",
 ]
 
-
-def texto(elemento: Tag | None) -> str:
-    """Normaliza o texto visível de um elemento HTML."""
-    if elemento is None:
-        return ""
-    return re.sub(r"\s+", " ", elemento.get_text(" ", strip=True)).strip()
+Registro = dict[str, str | int | bool]
 
 
-def elemento_por_classe(container: Tag, termos: tuple[str, ...]) -> Tag | None:
-    """Localiza um descendente cujo nome de classe contenha um dos termos."""
-    return container.find(
-        lambda tag: isinstance(tag, Tag)
-        and any(
-            termo in classe.lower()
-            for classe in tag.get("class", [])
-            for termo in termos
-        )
-    )
+class RespostaAPIInvalida(RuntimeError):
+    """Indica que a API respondeu sem o conjunto completo esperado."""
 
 
-def _fontes_por_indicador(soup: BeautifulSoup) -> dict[str, str]:
-    """Converte a tabela de fontes do IBGE em um mapa título -> fonte."""
-    fontes: dict[str, str] = {}
-    for celula in soup.select(".fontes-container td"):
-        rotulo = celula.find("b")
-        if rotulo is None:
-            continue
-        titulo_rotulo = texto(rotulo)
-        titulo = titulo_rotulo.rstrip(":").strip()
-        fonte = texto(celula)[len(titulo_rotulo) :].strip()
-        if titulo and fonte:
-            fontes[titulo] = fonte
-    return fontes
-
-
-def _separar_valor(
-    valor_bruto: str, unidade_explicita: str = "", periodo_explicito: str = ""
-) -> tuple[str, str, str]:
-    """Separa valor, unidade e período sem converter a notação brasileira."""
-    periodo_embutido = ""
-    correspondencia = re.search(r"\[([^\]]+)\]\s*$", valor_bruto)
-    if correspondencia:
-        periodo_embutido = correspondencia.group(1).strip()
-        valor_bruto = valor_bruto[: correspondencia.start()].strip()
-
-    periodo = periodo_explicito.strip().strip("[]") or periodo_embutido
-    unidade = unidade_explicita.strip()
-    unidade_embutida = ""
-
-    if valor_bruto.startswith("R$"):
-        unidade_embutida = "R$"
-        valor_bruto = valor_bruto[2:].strip()
-
-    for candidata in (
-        "óbitos por mil nascidos vivos",
-        "hab/km²",
-        "pessoas",
-        "reais",
-        "km²",
-        "%",
-        "R$",
-    ):
-        if valor_bruto.endswith(candidata):
-            unidade_embutida = unidade_embutida or candidata
-            valor_bruto = valor_bruto[: -len(candidata)].strip()
-            break
-
-    return valor_bruto, unidade or unidade_embutida, periodo
-
-
-def extrair_indicadores(html: str) -> list[dict[str, str]]:
-    """Extrai os cards e suas fontes do HTML renderizado pelo IBGE."""
-    soup = BeautifulSoup(html, "html.parser")
-    candidatos = soup.select(".indicador, [class*='indicador-card']")
-    fontes = _fontes_por_indicador(soup)
-
-    indicadores: list[dict[str, str]] = []
-    vistos: set[tuple[str, str, str]] = set()
-
-    for card in candidatos:
-        titulo_elemento = card.select_one(".ind-label p") or elemento_por_classe(
-            card, ("titulo", "title", "nome", "label")
-        )
-        valor_elemento = card.select_one(".ind-value") or elemento_por_classe(
-            card, ("valor", "value", "numero", "number")
-        )
-        unidade_elemento = card.select_one(
-            ".indicador-unidade"
-        ) or elemento_por_classe(card, ("unidade", "unit"))
-        periodo_elemento = (
-            valor_elemento.select_one("small") if valor_elemento else None
-        ) or elemento_por_classe(card, ("periodo", "ano", "year"))
-        fonte_elemento = elemento_por_classe(card, ("fonte", "source"))
-
-        titulo = texto(titulo_elemento)
-        valor_bruto = texto(valor_elemento)
-        unidade_explicita = texto(unidade_elemento)
-        periodo_explicito = texto(periodo_elemento)
-        fonte = texto(fonte_elemento) or fontes.get(titulo, "")
-
-        if not titulo or not valor_bruto or titulo == valor_bruto:
-            continue
-
-        valor, unidade, periodo = _separar_valor(
-            valor_bruto, unidade_explicita, periodo_explicito
-        )
-        if not valor:
-            continue
-
-        chave = (titulo, valor, periodo)
-        if chave in vistos:
-            continue
-        vistos.add(chave)
-
-        indicadores.append(
-            {
-                "indicador": titulo,
-                "valor": valor,
-                "unidade": unidade,
-                "periodo": periodo,
-                "fonte": fonte,
-            }
-        )
-
-    return indicadores
-
-
-def carregar_pagina(page: Page, url: str) -> str:
-    """Abre a página e espera o conjunto completo de indicadores."""
-    ultimo_erro = "conteúdo esperado não carregado"
-
-    for tentativa in range(1, 3):
-        try:
-            resposta = page.goto(
-                url, wait_until="domcontentloaded", timeout=90_000
-            )
-            if resposta is not None and resposta.status >= 400:
-                raise RuntimeError(f"HTTP {resposta.status}")
-
-            for rotulo in ("Aceitar todos", "Aceitar", "Concordar"):
-                botao = page.get_by_role(
-                    "button", name=re.compile(rotulo, re.I)
-                )
-                if botao.count():
-                    try:
-                        botao.first.click(timeout=2_000)
-                    except PlaywrightTimeoutError:
-                        pass
-                    break
-
-            page.locator(
-                ".indicador .ind-label", has_text="PIB per capita"
-            ).first.wait_for(timeout=30_000)
-            page.wait_for_timeout(500)
-            return page.content()
-        except (PlaywrightTimeoutError, RuntimeError) as erro:
-            ultimo_erro = f"{erro}; título recebido: {page.title()!r}"
-            if tentativa < 2:
-                page.wait_for_timeout(1_000)
-
-    raise RuntimeError(
-        f"Não foi possível carregar os indicadores de {url}: {ultimo_erro}"
-    )
-
-
-def coletar_municipios(
-    page: Page,
+def montar_url(
     municipios: Mapping[str, str] = MUNICIPIOS,
-    indicadores_obrigatorios: frozenset[str] | None = None,
-) -> tuple[list[dict[str, str]], dict[str, str]]:
-    """Coleta todos os municípios e devolve registros e falhas separadamente."""
-    registros: list[dict[str, str]] = []
-    falhas: dict[str, str] = {}
+    indicadores: Mapping[int, Indicador] = INDICADORES,
+) -> str:
+    """Monta uma única consulta em lote para municípios e indicadores."""
+    ids_indicadores = "|".join(str(codigo) for codigo in indicadores)
+    ids_municipios = "|".join(municipios.values())
+    return (
+        f"{API_BASE}/{ids_indicadores}/resultados/{ids_municipios}"
+        "?groupBy=localidade"
+    )
 
-    for municipio, url in municipios.items():
-        print(f"Coletando {municipio}...")
-        try:
-            indicadores = extrair_indicadores(carregar_pagina(page, url))
-            if not indicadores:
-                raise RuntimeError("nenhum indicador encontrado")
 
-            if indicadores_obrigatorios:
-                encontrados = {item["indicador"] for item in indicadores}
-                ausentes = indicadores_obrigatorios - encontrados
-                if ausentes:
-                    raise RuntimeError(
-                        "indicadores obrigatórios ausentes: "
-                        + ", ".join(sorted(ausentes))
-                    )
+def criar_sessao() -> requests.Session:
+    """Cria uma sessão HTTP com tentativas para erros transitórios."""
+    repeticao = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+    )
+    adaptador = HTTPAdapter(max_retries=repeticao)
+    sessao = requests.Session()
+    sessao.headers.update(
+        {
+            "Accept": "application/json",
+            "User-Agent": "scraping-ibge-historico/1.0",
+        }
+    )
+    sessao.mount("https://", adaptador)
+    return sessao
 
-            registros.extend(
-                {"municipio": municipio, **indicador, "url": url}
-                for indicador in indicadores
+
+def consultar_api(
+    sessao: requests.Session | None = None,
+    municipios: Mapping[str, str] = MUNICIPIOS,
+    indicadores: Mapping[int, Indicador] = INDICADORES,
+) -> tuple[list[object], str]:
+    """Consulta a API e devolve o JSON bruto e a URL efetivamente utilizada."""
+    sessao_propria = sessao is None
+    cliente = sessao or criar_sessao()
+    try:
+        resposta = cliente.get(
+            montar_url(municipios, indicadores), timeout=TIMEOUT_API
+        )
+        resposta.raise_for_status()
+        conteudo = resposta.json()
+        if not isinstance(conteudo, list):
+            raise RespostaAPIInvalida("A resposta da API não é uma lista.")
+        return conteudo, resposta.url
+    except requests.RequestException as erro:
+        raise RuntimeError(f"Falha ao consultar a API do IBGE: {erro}") from erro
+    finally:
+        if sessao_propria:
+            cliente.close()
+
+
+def _codigo_completo(
+    codigo_api: str, municipios: Mapping[str, str]
+) -> tuple[str, str] | None:
+    """Relaciona o código de seis dígitos da resposta ao código oficial."""
+    for nome, codigo in municipios.items():
+        if codigo[:-1] == codigo_api:
+            return nome, codigo
+    return None
+
+
+def normalizar_historico(
+    conteudo: Sequence[object],
+    url: str,
+    municipios: Mapping[str, str] = MUNICIPIOS,
+    indicadores: Mapping[int, Indicador] = INDICADORES,
+) -> list[Registro]:
+    """Converte a resposta agrupada da API em registros históricos tabulares."""
+    registros: list[Registro] = []
+    localidades_encontradas: set[str] = set()
+    indicadores_encontrados: dict[str, set[int]] = {
+        codigo: set() for codigo in municipios.values()
+    }
+
+    for bloco in conteudo:
+        if not isinstance(bloco, dict):
+            raise RespostaAPIInvalida("Bloco de localidade em formato inválido.")
+
+        localidade = _codigo_completo(str(bloco.get("localidade", "")), municipios)
+        if localidade is None:
+            continue
+        municipio, codigo_ibge = localidade
+        localidades_encontradas.add(codigo_ibge)
+
+        respostas = bloco.get("res")
+        if not isinstance(respostas, list):
+            raise RespostaAPIInvalida(
+                f"Séries ausentes para o município {municipio}."
             )
-            print(f"  {len(indicadores)} indicadores encontrados.")
-        except Exception as erro:
-            falhas[municipio] = str(erro)
-            print(f"  Erro ao coletar {municipio}: {erro}")
 
-    return registros, falhas
+        for serie in respostas:
+            if not isinstance(serie, dict):
+                continue
+            try:
+                indicador_id = int(serie.get("indicador", ""))
+            except (TypeError, ValueError):
+                continue
+            metadados = indicadores.get(indicador_id)
+            if metadados is None:
+                continue
+
+            valores = serie.get("res")
+            notas = serie.get("notas") or {}
+            if not isinstance(valores, dict) or not isinstance(notas, dict):
+                raise RespostaAPIInvalida(
+                    f"Série {indicador_id} inválida para {municipio}."
+                )
+            indicadores_encontrados[codigo_ibge].add(indicador_id)
+
+            periodos = sorted(
+                valores, key=lambda item: (len(str(item)), str(item))
+            )
+            for periodo in periodos:
+                valor_bruto = valores[periodo]
+                valor = "" if valor_bruto is None else str(valor_bruto).strip()
+                nota_bruta = notas.get(periodo)
+                registros.append(
+                    {
+                        "municipio": municipio,
+                        "codigo_ibge": codigo_ibge,
+                        "indicador_id": indicador_id,
+                        "indicador": metadados.nome,
+                        "valor": valor,
+                        "unidade": metadados.unidade,
+                        "periodo": str(periodo),
+                        "disponivel": valor not in SIMBOLOS_INDISPONIVEIS,
+                        "nota": "" if nota_bruta is None else str(nota_bruta),
+                        "fonte": metadados.fonte,
+                        "url": url,
+                    }
+                )
+
+    codigos_esperados = set(municipios.values())
+    if localidades_encontradas != codigos_esperados:
+        ausentes = codigos_esperados - localidades_encontradas
+        raise RespostaAPIInvalida(
+            "Municípios ausentes na resposta: " + ", ".join(sorted(ausentes))
+        )
+
+    ids_esperados = set(indicadores)
+    for municipio, codigo in municipios.items():
+        ausentes = ids_esperados - indicadores_encontrados[codigo]
+        if ausentes:
+            raise RespostaAPIInvalida(
+                f"Indicadores ausentes para {municipio}: "
+                + ", ".join(str(item) for item in sorted(ausentes))
+            )
+
+    ordem_municipios = {
+        codigo: indice for indice, codigo in enumerate(municipios.values())
+    }
+    ordem_indicadores = {
+        codigo: indice for indice, codigo in enumerate(indicadores)
+    }
+    registros.sort(
+        key=lambda item: (
+            ordem_municipios[str(item["codigo_ibge"])],
+            ordem_indicadores[int(item["indicador_id"])],
+            str(item["periodo"]),
+        )
+    )
+    return registros
+
+
+def coletar_historico(
+    sessao: requests.Session | None = None,
+    municipios: Mapping[str, str] = MUNICIPIOS,
+    indicadores: Mapping[int, Indicador] = INDICADORES,
+) -> list[Registro]:
+    """Consulta e valida todas as séries históricas configuradas."""
+    conteudo, url = consultar_api(sessao, municipios, indicadores)
+    return normalizar_historico(conteudo, url, municipios, indicadores)
 
 
 def _escrever_atomico(caminho: Path, conteudo: str, encoding: str) -> None:
-    """Grava em arquivo temporário e publica com substituição atômica."""
     temporario: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -279,11 +297,11 @@ def _escrever_atomico(caminho: Path, conteudo: str, encoding: str) -> None:
         raise
 
 
-def salvar_resultados(registros: list[dict[str, str]]) -> None:
-    """Publica JSON e CSV somente depois de ambos estarem serializados."""
+def salvar_resultados(registros: list[Registro]) -> None:
+    """Publica as séries históricas nos formatos JSON e CSV."""
     PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
-    caminho_json = PASTA_SAIDA / "municipios_ibge.json"
-    caminho_csv = PASTA_SAIDA / "municipios_ibge.csv"
+    caminho_json = PASTA_SAIDA / "municipios_ibge_historico.json"
+    caminho_csv = PASTA_SAIDA / "municipios_ibge_historico.csv"
 
     conteudo_json = json.dumps(registros, ensure_ascii=False, indent=2)
     buffer_csv = io.StringIO(newline="")
@@ -293,43 +311,21 @@ def salvar_resultados(registros: list[dict[str, str]]) -> None:
 
     _escrever_atomico(caminho_json, conteudo_json, "utf-8")
     _escrever_atomico(caminho_csv, buffer_csv.getvalue(), "utf-8-sig")
-
     print(f"JSON salvo em: {caminho_json.resolve()}")
     print(f"CSV salvo em:  {caminho_csv.resolve()}")
 
 
 def main() -> None:
-    with sync_playwright() as playwright:
-        navegador = playwright.chromium.launch(headless=True)
-        contexto = navegador.new_context(
-            locale="pt-BR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        )
-        try:
-            registros, falhas = coletar_municipios(
-                contexto.new_page(),
-                MUNICIPIOS,
-                INDICADORES_OBRIGATORIOS,
-            )
-        finally:
-            contexto.close()
-            navegador.close()
-
-    if falhas:
-        detalhes = "; ".join(
-            f"{municipio}: {erro}" for municipio, erro in falhas.items()
-        )
-        raise RuntimeError(
-            "Coleta incompleta; os arquivos anteriores foram preservados. "
-            + detalhes
-        )
+    print("Consultando séries históricas na API do IBGE...")
+    registros = coletar_historico()
     if not registros:
-        raise RuntimeError("Nenhum dado foi coletado; nada foi publicado.")
+        raise RuntimeError(
+            "Nenhuma série histórica foi retornada; nada foi publicado."
+        )
 
+    for municipio in MUNICIPIOS:
+        quantidade = sum(item["municipio"] == municipio for item in registros)
+        print(f"  {municipio}: {quantidade} observações históricas.")
     salvar_resultados(registros)
 
 

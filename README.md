@@ -1,25 +1,52 @@
-# Scraper de municípios do IBGE
+# Séries históricas municipais do IBGE
 
-Projeto em Python para coletar os indicadores exibidos nas páginas de
-**Cidades e Estados** do IBGE. O scraper utiliza Playwright para renderizar o
-conteúdo dinâmico e Beautiful Soup para extrair os dados.
+Projeto em Python para coletar séries históricas municipais diretamente da
+API oficial de Pesquisas do IBGE. A implementação não depende de scraping de
+HTML, navegador automatizado ou seletores sujeitos a mudanças no portal.
 
-Atualmente, o projeto coleta informações dos seguintes municípios do Ceará:
+Os mesmos municípios cearenses do projeto original são mantidos:
 
-- Cedro;
-- Várzea Alegre;
-- Lavras da Mangabeira;
-- Aurora.
+- Cedro (`2303808`);
+- Várzea Alegre (`2314003`);
+- Lavras da Mangabeira (`2307502`);
+- Aurora (`2301703`).
 
-Os resultados são exportados nos formatos CSV e JSON.
+Os resultados são exportados nos formatos CSV e JSON, com uma observação para
+cada combinação de município, indicador e período disponível.
+
+## Indicadores e cobertura histórica
+
+| ID na API | Indicador | Períodos atualmente disponíveis |
+| ---: | --- | --- |
+| `60045` | Escolarização de 6 a 14 anos | 2010 e 2022 |
+| `329756` | IDHM | 1991, 2000 e 2010 |
+| `30279` | Mortalidade infantil | Série anual desde 2006 |
+| `28141` | Total de receitas brutas realizadas | Série anual desde 2013 |
+| `29749` | Total de despesas brutas empenhadas | Série anual desde 2013 |
+| `47001` | PIB per capita | Série anual desde 2010 |
+
+A cobertura final é determinada pela própria API em cada execução. Novos
+períodos publicados pelo IBGE são incorporados automaticamente.
+
+## Arquitetura
+
+O programa monta uma única requisição em lote para todos os municípios e
+indicadores. A resposta agrupada por localidade é validada antes da publicação:
+todos os quatro municípios e todos os seis indicadores precisam estar
+presentes. Em caso de resposta parcial ou erro HTTP, os arquivos anteriores
+são preservados.
+
+As requisições possuem timeout e repetição automática para erros transitórios,
+como HTTP 429 e falhas 5xx. Os arquivos são gravados primeiro em caminhos
+temporários e publicados por substituição atômica.
 
 ## Tecnologias
 
 - Python 3.12;
-- Playwright;
-- Beautiful Soup;
-- Docker;
-- Docker Compose.
+- Requests;
+- API de Pesquisas do IBGE;
+- Docker e Docker Compose;
+- Pytest.
 
 ## Estrutura do projeto
 
@@ -29,6 +56,7 @@ Os resultados são exportados nos formatos CSV e JSON.
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── tests/
+│   └── test_scraping_ibge_municipios.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .dockerignore
@@ -37,55 +65,24 @@ Os resultados são exportados nos formatos CSV e JSON.
 └── README.md
 ```
 
-Depois da execução, o diretório `resultados_ibge` conterá:
-
-```text
-resultados_ibge/
-├── municipios_ibge.csv
-└── municipios_ibge.json
-```
-
-## Pré-requisitos
-
-Para executar com Docker, instale:
-
-- [Docker](https://docs.docker.com/get-docker/);
-- Docker Compose, já incluído nas versões atuais do Docker Desktop.
-
 ## Executando com Docker Compose
 
-Clone o repositório e entre no diretório do projeto:
-
-```bash
-git clone git@github.com:thiagobessaphd/scraping_ibge.git
-cd scraping_ibge
-```
-
-Crie o diretório de saída, construa a imagem e execute o scraper:
+Crie o diretório de saída e execute:
 
 ```bash
 mkdir -p resultados_ibge
 docker compose up --build
 ```
 
-O processo do scraper é executado no contêiner como usuário sem privilégios.
-Em Linux, se um diretório de saída já existente não permitir escrita ao seu
-usuário, ajuste as permissões desse diretório antes de iniciar o Compose.
-
-Ao terminar, o contêiner será encerrado e os arquivos estarão disponíveis em:
+Ao concluir, os arquivos estarão disponíveis em:
 
 ```text
-./resultados_ibge/municipios_ibge.csv
-./resultados_ibge/municipios_ibge.json
+resultados_ibge/
+├── municipios_ibge_historico.csv
+└── municipios_ibge_historico.json
 ```
 
-Nas próximas execuções, se não houver alterações na imagem, basta utilizar:
-
-```bash
-docker compose up
-```
-
-Para executar novamente sem manter o contêiner criado anteriormente:
+Para executar novamente sem manter o contêiner:
 
 ```bash
 docker compose run --rm scraper-ibge
@@ -93,97 +90,69 @@ docker compose run --rm scraper-ibge
 
 ## Executando sem Docker
 
-É necessário ter o Python 3.12 ou superior instalado, a mesma versão principal
-usada pela imagem Docker do projeto.
-
-Crie e ative um ambiente virtual:
+Crie e ative um ambiente virtual com Python 3.12 ou superior:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+python scraping_ibge_municipios.py
 ```
 
-No Windows PowerShell:
+No Windows PowerShell, a ativação do ambiente é feita com:
 
 ```powershell
 .venv\Scripts\Activate.ps1
 ```
 
-Instale as dependências e o navegador Chromium:
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-```
-
-Execute o scraper:
-
-```bash
-python scraping_ibge_municipios.py
-```
-
 ## Executando os testes
-
-Com o ambiente virtual ativo, instale as dependências de desenvolvimento e
-execute a suíte:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-## Formato dos dados
+Os testes não acessam a internet: respostas da API são simuladas para validar
+URL, timeout, períodos, símbolos de indisponibilidade, falhas parciais e
+equivalência entre CSV e JSON.
 
-Cada registro exportado contém os seguintes campos:
+## Formato dos dados
 
 | Campo | Descrição |
 | --- | --- |
 | `municipio` | Nome do município |
-| `indicador` | Nome do indicador disponibilizado pelo IBGE |
-| `valor` | Valor apresentado na página |
-| `unidade` | Unidade de medida, quando informada |
-| `periodo` | Ano ou período de referência, quando informado |
-| `fonte` | Fonte indicada pelo IBGE, quando informada |
-| `url` | Página de origem do registro |
+| `codigo_ibge` | Código oficial do município com sete dígitos |
+| `indicador_id` | Identificador do indicador na API |
+| `indicador` | Nome legível do indicador |
+| `valor` | Valor textual retornado pela API, sem perda de precisão |
+| `unidade` | Unidade de medida |
+| `periodo` | Ano ou período de referência |
+| `disponivel` | Indica se o valor representa um dado disponível |
+| `nota` | Nota específica do período, quando fornecida |
+| `fonte` | Instituição ou pesquisa responsável pelo indicador |
+| `url` | URL exata utilizada na consulta em lote |
 
-Entre os indicadores coletados estão os dados demográficos já exportados pelo
-projeto e também:
+Símbolos especiais do IBGE, como `-`, `..`, `...` e `X`, são preservados em
+`valor` e marcados com `disponivel: false`. Isso permite distinguir ausência de
+dado de valores numéricos iguais a zero.
 
-- Escolarização;
-- Índice de Desenvolvimento Humano Municipal (IDHM);
-- Mortalidade infantil;
-- Total de receitas brutas realizadas;
-- Total de despesas brutas empenhadas;
-- PIB per capita.
+## Adicionando municípios
 
-O arquivo CSV utiliza codificação UTF-8 com BOM, facilitando sua abertura no
-Microsoft Excel sem perder os acentos.
-
-## Adicionando outros municípios
-
-Edite o dicionário `MUNICIPIOS`, no início do arquivo
-`scraping_ibge_municipios.py`:
+Edite o dicionário `MUNICIPIOS` no início de
+`scraping_ibge_municipios.py`, informando o nome e o código IBGE de sete
+dígitos:
 
 ```python
 MUNICIPIOS = {
-    "Cedro": "https://www.ibge.gov.br/cidades-e-estados/ce/cedro.html",
-    "Novo município": "URL_DA_PAGINA_DO_MUNICIPIO",
+    "Cedro": "2303808",
+    "Novo município": "0000000",
 }
 ```
 
-## Observações
-
-- O scraper depende da estrutura atual das páginas do IBGE. Alterações no HTML
-  podem exigir ajustes nos seletores.
-- O projeto aguarda o carregamento dinâmico antes de extrair os indicadores.
-- Evite execuções excessivamente frequentes. Consulte e respeite os termos de
-  uso e as políticas de acesso do IBGE.
-- Os dados pertencem às suas respectivas fontes oficiais. Este projeto apenas
-  automatiza a coleta das informações públicas exibidas nas páginas.
-
 ## Fonte dos dados
 
-[IBGE — Cidades e Estados](https://www.ibge.gov.br/cidades-e-estados.html)
+- [Serviço de dados do IBGE](https://servicodados.ibge.gov.br/api/docs/);
+- [Sistema IBGE de Recuperação Automática — SIDRA](https://sidra.ibge.gov.br/).
 
 ## Licença
 
